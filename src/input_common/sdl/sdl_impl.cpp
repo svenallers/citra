@@ -163,14 +163,11 @@ public:
         std::lock_guard lock{mutex};
         AxisAttributes attributes = state.axes_attributes.at(axis);
         int relative_pos = state.axes.at(axis) - attributes.axis_min;
-        LOG_INFO(Input, "{}: {} - {} = {} / {} = {}", axis, state.axes.at(axis), attributes.axis_min, relative_pos, attributes.axis_range, (relative_pos / attributes.axis_range));
         return relative_pos / attributes.axis_range;
     }
 
     std::tuple<float, float> GetAnalog(int axis_x, int axis_y) const {
-        LOG_INFO(Input, "X");
         float x = GetAxis(axis_x);
-        LOG_INFO(Input, "Y");
         float y = GetAxis(axis_y);
         y = -y; // 3DS uses an y-axis inverse from SDL
 
@@ -674,15 +671,19 @@ private:
 
 class SDLAnalog final : public Input::AnalogDevice {
 public:
-    SDLAnalog(std::shared_ptr<SDLJoystick> joystick_, int axis_x_, int axis_y_, float deadzone_)
-        : joystick(std::move(joystick_)), axis_x(axis_x_), axis_y(axis_y_), deadzone(deadzone_) {}
+    SDLAnalog(std::shared_ptr<SDLJoystick> joystick_, int axis_x_, int axis_y_, float deadzone_, float maxzone_)
+        : joystick(std::move(joystick_)), axis_x(axis_x_), axis_y(axis_y_), deadzone(deadzone_), maxzone(maxzone_) {}
 
     std::tuple<float, float> GetStatus() const override {
         const auto [x, y] = joystick->GetAnalog(axis_x, axis_y);
         const float r = std::sqrt((x * x) + (y * y));
         if (r > deadzone) {
-            return std::make_tuple(x / r * (r - deadzone) / (1 - deadzone),
-                                   y / r * (r - deadzone) / (1 - deadzone));
+            float r_in_zone = (r - deadzone) / (maxzone - deadzone);
+            if (r_in_zone > 1.0f) {
+                r_in_zone = 1.0f;
+            }
+            return std::make_tuple(x / r * r_in_zone,
+                                   y / r * r_in_zone);
         }
         return std::make_tuple<float, float>(0.0f, 0.0f);
     }
@@ -692,6 +693,7 @@ private:
     const int axis_x;
     const int axis_y;
     const float deadzone;
+    const float maxzone;
 };
 
 /// A button device factory that creates button devices from SDL joystick
@@ -800,6 +802,7 @@ public:
         const int axis_y_min = params.Get("axis_y_min", 0);
         const int axis_y_range = params.Get("axis_y_range", SDL_JOYSTICK_AXIS_MAX);
         float deadzone = std::clamp(params.Get("deadzone", 0.0f), 0.0f, .99f);
+        float maxzone = 0.7f; // Triggering the Switch Pro sticks at the max level leads to values that are 70% of the actual axis_max that is why we define the 70% as the new max
 
         auto joystick = state.GetSDLJoystickByGUID(guid, port);
 
@@ -808,7 +811,7 @@ public:
         joystick->SetAxisAttributes(axis_x, axis_x_min, axis_x_range);
         joystick->SetAxis(axis_y, 0);
         joystick->SetAxisAttributes(axis_y, axis_y_min, axis_y_range);
-        return std::make_unique<SDLAnalog>(joystick, axis_x, axis_y, deadzone);
+        return std::make_unique<SDLAnalog>(joystick, axis_x, axis_y, deadzone, maxzone);
     }
 
 private:
