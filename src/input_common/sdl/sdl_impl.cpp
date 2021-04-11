@@ -75,6 +75,18 @@ namespace InputCommon {
 
 namespace SDL {
 
+static void SetAxisParams(const std::string& axis_name, SDL_ExtendedGameControllerBind extended_bind, Common::ParamPackage& params) {
+    int axis_range;
+    if (extended_bind.input.axis.axis_max < extended_bind.input.axis.axis_min) {
+        axis_range = extended_bind.input.axis.axis_min - extended_bind.input.axis.axis_max;
+    } else {
+        axis_range = extended_bind.input.axis.axis_max - extended_bind.input.axis.axis_min;
+    }
+    params.Set(axis_name, extended_bind.input.axis.axis);
+    params.Set(axis_name+"_min", extended_bind.input.axis.axis_min);
+    params.Set(axis_name+"_range", axis_range);
+}
+
 static std::string GetGUID(SDL_Joystick* joystick) {
     SDL_JoystickGUID guid = SDL_JoystickGetGUID(joystick);
     char guid_str[33];
@@ -142,13 +154,23 @@ public:
         state.axes[axis] = value;
     }
 
+    void SetAxisAttributes(int axis, int axis_min, int axis_range) {
+        std::lock_guard lock{mutex};
+        state.axes_attributes[axis] = AxisAttributes{axis_min, static_cast<float>(axis_range)};
+    }
+
     float GetAxis(int axis) const {
         std::lock_guard lock{mutex};
-        return state.axes.at(axis) / 32767.0f;
+        AxisAttributes attributes = state.axes_attributes.at(axis);
+        int relative_pos = state.axes.at(axis) - attributes.axis_min;
+        LOG_INFO(Input, "{}: {} - {} = {} / {} = {}", axis, state.axes.at(axis), attributes.axis_min, relative_pos, attributes.axis_range, (relative_pos / attributes.axis_range));
+        return relative_pos / attributes.axis_range;
     }
 
     std::tuple<float, float> GetAnalog(int axis_x, int axis_y) const {
+        LOG_INFO(Input, "X");
         float x = GetAxis(axis_x);
+        LOG_INFO(Input, "Y");
         float y = GetAxis(axis_y);
         y = -y; // 3DS uses an y-axis inverse from SDL
 
@@ -200,9 +222,14 @@ public:
     }
 
 private:
+    struct AxisAttributes {
+        int axis_min;
+        float axis_range;
+    };
     struct State {
         std::unordered_map<int, bool> buttons;
         std::unordered_map<int, Sint16> axes;
+        std::unordered_map<int, AxisAttributes> axes_attributes;
         std::unordered_map<int, Uint8> hats;
     } state;
     std::string guid;
@@ -374,8 +401,6 @@ Common::ParamPackage SDLState::GetSDLControllerButtonBindByGUID(
         }
         break;
     case SDL_CONTROLLER_BINDTYPE_AXIS:
-        params.Set("axis", button_bind.value.axis);
-
 #if SDL_VERSION_ATLEAST(2, 0, 6)
         {
             const SDL_ExtendedGameControllerBind extended_bind =
@@ -385,13 +410,10 @@ Common::ParamPackage SDLState::GetSDLControllerButtonBindByGUID(
             } else {
                 params.Set("direction", "+");
             }
-            params.Set(
-                "threshold",
-                (extended_bind.input.axis.axis_min +
-                 (extended_bind.input.axis.axis_max - extended_bind.input.axis.axis_min) / 2.0f) /
-                    SDL_JOYSTICK_AXIS_MAX);
+            SetAxisParams("axis", extended_bind, params);
         }
 #else
+        params.Set("axis", button_bind.value.axis);
         params.Set("direction", "+"); // lacks extended_bind, so just a guess
 #endif
         break;
@@ -435,8 +457,22 @@ Common::ParamPackage SDLState::GetSDLControllerAnalogBindByGUID(
         button_bind_y.bindType != SDL_CONTROLLER_BINDTYPE_AXIS) {
         return {{}};
     }
-    params.Set("axis_x", button_bind_x.value.axis);
-    params.Set("axis_y", button_bind_y.value.axis);
+
+    for(int i = 0; true; i++){//TODO I hate this approach as it is not safe, but I don't know better because my cpp skills suck :-(
+        const SDL_ExtendedGameControllerBind extended_bind = controller->bindings[i];
+        if (extended_bind.input.axis.axis == button_bind_x.value.axis) {
+            SetAxisParams("axis_x", extended_bind, params);
+            break;
+        }
+    }
+    //TODO Move those for loops into a function
+    for(int i = 0; true; i++){
+        const SDL_ExtendedGameControllerBind extended_bind = controller->bindings[i];
+        if (extended_bind.input.axis.axis == button_bind_y.value.axis) {
+            SetAxisParams("axis_y", extended_bind, params);
+            break;
+        }
+    }
     return params;
 }
 
@@ -671,10 +707,10 @@ public:
      *     - "button"(optional): the index of the button to bind
      *     - "hat"(optional): the index of the hat to bind as direction buttons
      *     - "axis"(optional): the index of the axis to bind
+     *     - "axis_min"(optional): the min value of the axis to bind
+     *     - "axis_range"(optional): the range of values the axis to bind is covering
      *     - "direction"(only used for hat): the direction name of the hat to bind. Can be "up",
      *         "down", "left" or "right"
-     *     - "threshold"(only used for axis): a float value in (-1.0, 1.0) which the button is
-     *         triggered if the axis value crosses
      *     - "direction"(only used for axis): "+" means the button is triggered when the axis
      * value is greater than the threshold; "-" means the button is triggered when the axis
      * value is smaller than the threshold
@@ -707,12 +743,16 @@ public:
 
         if (params.Has("axis")) {
             const int axis = params.Get("axis", 0);
-            const float threshold = params.Get("threshold", 0.5f);
+            const int axis_min = params.Get("axis_min", 0);
+            const int axis_range = params.Get("axis_range", SDL_JOYSTICK_AXIS_MAX);
             const std::string direction_name = params.Get("direction", "");
             bool trigger_if_greater;
+            float threshold;
             if (direction_name == "+") {
+                threshold = 0.5f;
                 trigger_if_greater = true;
             } else if (direction_name == "-") {
+                threshold = -0.5f;
                 trigger_if_greater = false;
             } else {
                 trigger_if_greater = true;
@@ -720,6 +760,7 @@ public:
             }
             // This is necessary so accessing GetAxis with axis won't crash
             joystick->SetAxis(axis, 0);
+            joystick->SetAxisAttributes(axis, axis_min, axis_range);
             return std::make_unique<SDLAxisButton>(joystick, axis, threshold, trigger_if_greater);
         }
 
@@ -743,20 +784,30 @@ public:
      *     - "guid": the guid of the joystick to bind
      *     - "port": the nth joystick of the same type
      *     - "axis_x": the index of the axis to be bind as x-axis
+     *     - "axis_x_min": the min value of the x-axis to bind
+     *     - "axis_x_range": the range of values the x-axis to bind is covering
      *     - "axis_y": the index of the axis to be bind as y-axis
+     *     - "axis_y_min": the min value of the y-axis to bind
+     *     - "axis_y_range": the range of values the y-axis to bind is covering
      */
     std::unique_ptr<Input::AnalogDevice> Create(const Common::ParamPackage& params) override {
         const std::string guid = params.Get("guid", "0");
         const int port = params.Get("port", 0);
         const int axis_x = params.Get("axis_x", 0);
+        const int axis_x_min = params.Get("axis_x_min", 0);
+        const int axis_x_range = params.Get("axis_x_range", SDL_JOYSTICK_AXIS_MAX);
         const int axis_y = params.Get("axis_y", 1);
+        const int axis_y_min = params.Get("axis_y_min", 0);
+        const int axis_y_range = params.Get("axis_y_range", SDL_JOYSTICK_AXIS_MAX);
         float deadzone = std::clamp(params.Get("deadzone", 0.0f), 0.0f, .99f);
 
         auto joystick = state.GetSDLJoystickByGUID(guid, port);
 
         // This is necessary so accessing GetAxis with axis_x and axis_y won't crash
         joystick->SetAxis(axis_x, 0);
+        joystick->SetAxisAttributes(axis_x, axis_x_min, axis_x_range);
         joystick->SetAxis(axis_y, 0);
+        joystick->SetAxisAttributes(axis_y, axis_y_min, axis_y_range);
         return std::make_unique<SDLAnalog>(joystick, axis_x, axis_y, deadzone);
     }
 
@@ -835,10 +886,8 @@ Common::ParamPackage SDLEventToButtonParamPackage(SDLState& state, const SDL_Eve
         params.Set("axis", event.jaxis.axis);
         if (event.jaxis.value > 0) {
             params.Set("direction", "+");
-            params.Set("threshold", "0.5");
         } else {
             params.Set("direction", "-");
-            params.Set("threshold", "-0.5");
         }
         break;
     }
